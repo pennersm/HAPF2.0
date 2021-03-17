@@ -1,0 +1,1048 @@
+#!/bin/bash
+###########################################################################
+# NSN INSTA HAPF2.1 RESOURCE AGENT FOR CERTIFIER
+#--------------------------------------------------------------------------
+# Script default name   : $OCF_ROOT/resources.d/nsn/ICertifier
+# Script version        : 1.2
+# Configure version     : mkks62g.pl
+# Media set             : PF21I52RH64-12
+# File generated        : 19.07.2013 MPe
+#
+# (C) Nokia Siemens Networks 2012
+#
+###########################################################################
+#
+# OCF Instance parameters
+#        OCF_RESKEY_certifier_role
+#
+#
+# Initialization:
+
+: ${OCF_ROOT:=/usr/lib/ocf}
+. ${OCF_ROOT}/resource.d/heartbeat/.ocf-shellfuncs
+. ${OCF_ROOT}/resource.d/heartbeat/.ocf-returncodes
+#--------------------------------------------------------------------------
+shf_debug_break() {
+	shf_cont () { : ; } ;
+	echo "---------------- enter \"shf_cont\" to resume ------------------"
+	unset line
+	DBP="#-DEBUG-#"
+	while [ "$line" != "shf_cont" ] 
+	do
+		echo -n $DBP
+		read line
+		eval $line
+	done
+}
+#--------------------------------------------------------------------------
+
+certifier_haconf="/etc/hapf21.d/ICertifier-ha.cfg"
+if [ -r  ${certifier_haconf} ]; then
+	. ${certifier_haconf}
+	rc=$?
+	if [ "${rc}" = "0" ]; then
+		ocf_log debug "found and parsed configuration file \"${certifier_haconf}\""
+	elif [ ! -f ${certifier_haconf} ]; then
+		ocf_log info "did not find any configuration file \"${certifier_haconf}\""
+	else
+		ocf_log error "found configuration file \"${certifier_haconf}\" but can not access it"
+	fi
+fi
+
+if    [ "${OCF_RESKEY_certifier_role}" = "be" ]; then
+	RA_LOCAL_certifier_dir="/usr/local/certifier"
+elif  [ "${OCF_RESKEY_certifier_role}" = "fe" ]; then
+	RA_LOCAL_certifier_dir="/usr/local/certifsub"
+fi
+
+ocf_log debug "using role \"${OCF_RESKEY_certifier_role}\" and dir \"${RA_LOCAL_certifier_dir}\""
+
+# the call for this fix is made only once and inside the validation function
+: ${drbd_workaround:="/etc/drbd.d/startup_sbhelper"}
+
+ocf_log debug "set RA_LOCAL_certifier_dir to ${RA_LOCAL_certifier_dir}"
+# Default values, can be overwritten in ${certifier_haconf}
+: ${RA_LOCAL_certifier_server:="${RA_LOCAL_certifier_dir}/bin/ssh-ca-server"}
+: ${RA_LOCAL_certifier_engine:="${RA_LOCAL_certifier_dir}/bin/ssh-ca-engine"} 
+: ${RA_LOCAL_certifier_db:="/usr/local/certifier/sybase/certifier.db"}
+: ${RA_LOCAL_database_binary:="dbeng12"}
+: ${RA_LOCAL_certifier_snmpagent:="${RA_LOCAL_certifier_dir}/bin/certifier-snmp-daemon"}
+: ${RA_LOCAL_thales_daemon:="hardserver"}
+: ${RA_LOCAL_thales_user:="nfast"}
+: ${RA_LOCAL_certifier_user:="certfier"}
+: ${RA_LOCAL_certifier_group:="daemon"}
+: ${RA_LOCAL_use_hsm:="0"}
+: ${RA_LOCAL_use_snmp:="0"}
+: ${RA_LOCAL_leave_hsm:="yes"}
+: ${RA_LOCAL_insta_env_settings:="${RA_LOCAL_certifier_dir}/bin/ssh-ca-env"}
+: ${RA_LOCAL_insta_startscript:="${RA_LOCAL_certifier_dir}/ssh-ca-start"}
+: ${RA_LOCAL_insta_stopscript:="${RA_LOCAL_certifier_dir}/ssh-ca-stop"}
+: ${RA_LOCAL_certifier_engine_tlsint_port:="7001"}
+: ${RA_LOCAL_tlscert:="${RA_LOCAL_certifier_dir}/var/pki/cacomm-client.crt"}
+: ${RA_LOCAL_tlskey:="${RA_LOCAL_certifier_dir}/var/pki/cacomm-client.prv"}
+: ${RA_LOCAL_tlsCAfile:="${RA_LOCAL_certifier_dir}/var/pki/trusted_cacomm_ca.crt"}
+: ${RA_LOCAL_IGNORE_ISNMP:="false"}
+#
+#######################################################################
+# http://www.linux-ha.org/wiki/OCF_Resource_Agents
+# http://www.linux-ha.org/dec/dev-guides/ra-dev-guide.html
+# http://linux-ha.org/doc/man-pages/man-pages.html
+#
+#######################################################################
+# 
+meta_data() {
+	cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="ICertifier">
+<version>0.9</version>
+
+<longdesc lang="en">
+HAPF2.1 NSN Insta Certifier Resource Agent
+</longdesc>
+
+<shortdesc lang="en">Insta Certifier Resource Agent</shortdesc>
+
+<parameters>
+<parameter name="certifier_role" unique="1" required="1">
+<longdesc lang="en">
+The role of this resource in a certifier PKI.
+</longdesc>
+<shortdesc lang="en">server role: be XOR fe</shortdesc>
+<content type="string" default="be"/>
+</parameter>
+</parameters>
+
+<actions>
+<action name="start"           timeout="100" />
+<action name="stop"            timeout="100" />
+<action name="monitor"         timeout="30" interval="90" depth="0" start-delay="0" />
+<action name="validate-all"    timeout="100" />
+<action name="meta-data"       timeout="100" />
+</actions>
+</resource-agent>
+END
+}
+#
+
+
+#############################################################################################
+# test probes for each single process if active or not
+# with test_tcp as only common helper needed here
+# and test_becon kept isolated for better reuse
+#############################################################################################
+#--------------------------------------------------------------------------------------------
+sh_test_tcp() {
+	rc=10
+	port=$1
+	ip=$2
+	: ${ip:=127.0.0.1}
+# variant 1: this works more thorough as it opens the afs connect
+# on top of the tcp. however it leaves the socket in closewait 
+# and I am a bit scared we would need to either tune tcp_time_wait_interval
+# or get some strange effects otehrwise ... commenst welcome! (mario)
+#	rc=$(exec 5<>/dev/tcp/${ip}/${port})$?
+#	5<&-
+#	5>&-
+#
+# variant 2 is not so thorough but does not punch through the tcp stack
+ rc=$(( nmap -sT -P0 -p T:${port} ${ip} |grep "${port}/tcp open" ) &>/dev/null )$?
+# suggested to have a long-term test running on the berlin HW and adjust the monitor interval 
+# with the kernel params
+#
+#rc=0
+#
+return $rc
+}
+#--------------------------------------------------------------------------------------------
+sh_test_becon() {
+	NUMARGS=$1
+	unset TLSBEPRT BEIPADDR
+	local rc=${OCF_ERR_GENERIC}
+
+	BEIPADDR="$(echo ${NUMARGS}|awk -F':' '{print $1}')"
+	TLSBEPRT="$(echo ${NUMARGS}|awk -F':' '{print $2}')"
+
+	: ${TLSBEPRT:="${RA_LOCAL_certifier_engine_tlsint_port}"}
+	ENGSOCK="${BEIPADDR}:${TLSBEPRT}"
+	NSTAT=( $(netstat -tunap |awk -v AS="${ENGSOCK}" '($5==AS){print$6" "$7}') )
+	ocf_log debug "testing be connection to \"${ENGSOCK}\""	
+
+	if [ "${NSTAT[0]}" = "ESTABLISHED" ] && [ "ssh-ca-server" = "$(echo ${NSTAT[1]}|awk -F"/" '{print$2}' )" ]; then
+		ocf_log debug "netstat shows connectivity to \"${ENGSOCK}\""
+		echo ${NSTAT[1]}|awk -F"/" '{print$1}' 
+		rc=$OCF_SUCCESS
+	else
+		ocf_log debug "can not see an active BE connection to \"${ENGSOCK}\""
+	fi
+
+	if [ "${rc}" = "${OCF_SUCCESS}" ]; then
+#		openssl s_client -connect ${ENGSOCK} -certform der -keyform der \
+#		 -cert ${RA_LOCAL_tlscert} -key ${RA_LOCAL_tlskey} -CAfile ${RA_LOCAL_tlsCAfile} &>/dev/null <<-EOF
+#		EOF
+		sh_test_tcp ${TLSBEPRT} ${BEIPADDR}
+		sslrc=$?
+	fi
+
+	if [ "${sslrc}" = "${OCF_SUCCESS}" ]; then
+		ocf_log debug "TLS handshake with \"${ENGSOCK}\" verified as working: OK"
+	else
+		ocf_log error "can not establish TLS handshake with \"${ENGSOCK}\" openssl returned \"${sslrc}\""
+		rc=${OCF_ERR_GENERIC}
+	fi
+
+return $rc
+}
+#--------------------------------------------------------------------------------------------
+sh_test_db() {
+	rc=$OCF_NOT_RUNNING
+	
+	if [[ `echo ${STARA[0]} | sed 's/^[0-9]*//' | wc -c` -eq 1 ]]; then
+
+        	if ( ps -f -u ${RA_LOCAL_certifier_user}| awk -v PID="${STARA[0]}" '($2==PID){print$8$15}'| \
+		    grep ${RA_LOCAL_certifier_db} |grep ${RA_LOCAL_database_binary} &>/dev/null ) ; then
+			rc=$OCF_SUCCESS 
+                	ocf_log debug "verified PID ${STARA[0]} for ${RA_LOCAL_database_binary}" 
+		else
+			ocf_log err  "can not verify that process ${RA_LOCAL_database_binary} is up with PID ${STARA[0]}" 
+		fi
+
+		if ( ! ${RA_LOCAL_certifier_dir}/bin/ssh-ca-runenv dbping -q >/dev/null ) ; then
+		   rc=$OCF_ERR_GENERIC
+			ocf_log err "dbping not confirming connectvity to ${RA_LOCAL_certifier_db}"
+		fi
+
+	elif [ ${STARA[0]} = "FAIL" ]; then
+		
+		rc=$OCF_NOT_RUNNING
+                ocf_log info "process seems to be stopped: ${RA_LOCAL_database_binary}"
+
+        elif [ ${STARA[0]} = "N.A." -o ${STARA[0]} = "NULL" ]; then
+                ocf_log debug "process not part of this role: ${RA_LOCAL_certifier_db}"
+                rc=$OCF_NOT_RUNNING
+	
+	else
+		ocf_log err "can not recognize if this is the PID of ${RA_LOCAL_database_binary}:${STARA[0]}"
+	fi	
+
+return $rc
+}
+#
+#--------------------------------------------------------------------------------------------
+sh_test_engine() {
+	rc=$OCF_ERR_GENERIC
+	
+        if [[ `echo ${STARA[1]} | sed 's/^[0-9]*//' | wc -c` -eq 1 ]]; then
+
+		if ( ps -f -u ${RA_LOCAL_certifier_user}| awk -v PID="${STARA[1]}" '($2==PID){print$8}'| \
+		   grep ${RA_LOCAL_certifier_engine} &>/dev/null ) ; then
+			rc=$OCF_SUCCESS 
+			ocf_log debug "verified PID ${STARA[1]} for ${RA_LOCAL_certifier_engine}" 
+		else
+			ocf_log err  "can not verify that process ${RA_LOCAL_certifier_engine} is up with PID ${STARA[1]}"
+		fi
+
+	elif [ ${STARA[1]} = "FAIL" ]; then
+		
+		pidfile=$( basename ${RA_LOCAL_certifier_engine} )
+		rm -f "${RA_LOCAL_certifier_dir}/var/run/${pidfile}\@`uname -n`.pid"
+		rc=$OCF_NOT_RUNNING
+		ocf_log info "process seems to be stopped: ${RA_LOCAL_certifier_engine}"
+
+        elif [ ${STARA[1]} = "N.A." -o ${STARA[1]} = "NULL" ]; then
+                ocf_log debug "process not part of this role: ${RA_LOCAL_certifier_engine}"
+                rc=$OCF_NOT_RUNNING
+
+        else
+                ocf_log err "can not recognize if this is the PID of ${RA_LOCAL_certifier_engine}:${STARA[1]}"
+        fi     
+
+
+return $rc
+}
+#
+#--------------------------------------------------------------------------------------------
+sh_test_csnmp() {
+        if [[ `echo ${STARA[2]} | sed 's/^[0-9]*//' | wc -c` -eq 1 ]]; then
+
+        	if ( ps -f -u ${RA_LOCAL_certifier_user}| awk -v PID="${STARA[2]}" '($2==PID){print$8}'| \
+        	    grep ${RA_LOCAL_certifier_snmpagent} &>/dev/null ); then
+			rc=$OCF_SUCCESS
+        		ocf_log debug "verified PID ${STARA[2]} for ${RA_LOCAL_certifier_snmpagent}" 
+		else
+			ocf_log err "can not verify that process ${RA_LOCAL_certifier_snmpagent} is up with PID ${STARA[2]}"
+		fi
+
+		if ( ! sh_test_tcp 199  ) ; then
+			rc=$OCF_ERR_GENERIC
+			ocf_log err "port 199 does not react to TCP SYN"
+		fi
+		
+		if [ ! -S /var/agentx/master ] ; then
+			rc=$OCF_ERR_GENERIC 
+			ocf_log err "Socket /var/agentx/master does not exist" 
+		fi
+
+	elif [ ${STARA[2]} = "FAIL" ]; then
+
+		rc=$OCF_NOT_RUNNING
+		ocf_log info "process seems to be stopped: ${RA_LOCAL_certifier_snmpagent}"
+
+        elif [ ${STARA[2]} = "N.A." -o ${STARA[2]} = "NULL" ]; then
+                ocf_log debug "process not part of this role: ${RA_LOCAL_certifier_snmpagent}"
+                rc=$OCF_NOT_RUNNING
+
+	else
+		ocf_log err "can not recognize if this is the PID of ${RA_LOCAL_certifier_snmpagent}:${STARA[2]}"
+	fi
+
+return $rc
+}
+#
+#--------------------------------------------------------------------------------------------
+sh_test_hsm() {
+
+	rc=$OCF_ERR_GENERIC; unset OPCARD
+
+	if [[ `echo ${STARA[3]} | sed 's/^[0-9]*//' | wc -c` -eq 1 ]]; then
+
+		if ( ps -f -u ${RA_LOCAL_thales_user}| awk -v PID="${STARA[3]}" '($2==PID){print$8}'| \
+		   grep ${RA_LOCAL_thales_daemon} &>/dev/null ) ; then
+			hardserc=$OCF_SUCCESS
+			ocf_log debug "verified PID ${STARA[3]} for ${RA_LOCAL_thales_daemon}"
+		else
+			ocf_log err "can not verify that process ${RA_LOCAL_thales_daemon} is up with PID ${STARA[3]}"
+			hardserc=$OCF_ERR_GENERIC
+		fi
+
+		: ${HSMDIR:="/opt/nfast"}
+		TOOL="${HSMDIR}/bin/nfkminfo"
+		NUMSLTS="$(${TOOL} |grep  "Module #1 Slot #"|wc -l)"
+		let NUMSLTS=$NUMSLTS-1; hsmrc=$OCF_ERR_GENERIC
+
+		for SLT in $(seq 0 ${NUMSLTS})
+		do
+			CARDSTAT="$(${TOOL}|grep -A 4 "Module #1 Slot #${SLT}"|grep "^ state"|tr --squeeze-repeats ' '|cut -d' ' -f 4)"
+			if [ "${CARDSTAT}" = "Operator" ]; then
+				hsmrc=$OCF_SUCCESS; ocf_log debug "operator card found in \"Module #1 Slot #${SLT}\""
+				OPCARD="OK"
+			else
+				: ; ocf_log debug "hsm smartcard reader SLOT-${SLT}: \"${CARDSTAT}\""
+			fi
+		done
+
+		if [ "${hardserc}" -eq $OCF_SUCCESS ] && [ "${hsmrc}" -eq $OCF_SUCCESS ] ; then
+			rc=$OCF_SUCCESS 
+			ocf_log debug "thales hsm card and seems fine and has a configured operator card in the reader"
+			
+		elif [ "${hsmrc}" -ne $OCF_SUCCESS ] ; then
+			rc=$OCF_ERR_GENERIC ; OPCARD="NOK"
+			ocf_log err "thales hsm card or smartcard seems problematic - no operator card found in reader"
+		fi
+
+
+
+	elif [ ${STARA[3]} = "FAIL" ]; then
+		killhim=$(ps -u ncsnmpd --noheaders|awk '{print $1}')
+		timeout=15 ; thresh=5 ; let i=0
+		while [ ! -z "$(ps -u ncsnmpd --noheaders|awk '{print $1}' 2>/dev/null)" ] 
+		do
+			[ ${i} -le ${thresh} ] && ( /etc/init.d/nc_ncsnmpd stop )
+			[ ${i} -gt ${thresh} ] && kill -KILL $(ps -u ncsnmpd --noheaders|awk '{print $1}')
+			let i=${i}+1 
+			sleep 1
+		done
+		rc=$OCF_NOT_RUNNING
+		ocf_log info "processes seems to be stopped: ${RA_LOCAL_thales_daemon}"
+		
+	elif [ ${STARA[3]} = "N.A." -o ${STARA[3]} = "NULL" ]; then
+		ocf_log debug "process not part of this role: ${RA_LOCAL_thales_daemon}"
+		rc=$OCF_NOT_RUNNING
+	else
+		ocf_log err "can not recognize if this is the PID of ${RA_LOCAL_thales_daemon}: ${STARA[3]}"
+	fi
+
+return $rc
+}
+#
+#--------------------------------------------------------------------------------------------
+sh_test_server() {
+	rc=$OCF_ERR_GENERIC
+	cports=""
+
+	if [[ `echo ${STARA[4]} | sed 's/^[0-9]*//' | wc -c` -eq 1 ]]; then
+		local certifsub_match="./bin/ssh-ca-server"
+		if ( ps -f -u ${RA_LOCAL_certifier_user}| awk -v PID="${STARA[4]}" '($2==PID){print$8}'| \
+	           grep ${RA_LOCAL_certifier_server} &>/dev/null ) ; then
+#if ( ps -f -u ${RA_LOCAL_certifier_user}| awk -v PID="${STARA[4]}" '($2==PID){print$8}'| grep ${certifsub_match} &>/dev/null ) ; then
+
+			rc=$OCF_SUCCESS
+			ocf_log debug "verified PID ${STARA[4]} for ${RA_LOCAL_certifier_server}" 
+		else
+			ocf_log err "can not verify that process ${RA_LOCAL_certifier_server} is up with PID ${STARA[4]}"
+		fi
+
+		if [ "${#RA_LOCAL_BEIP[@]}" -ge 1 ] && [ "${rc}" = "${OCF_SUCCESS}" ] ; then
+			let i=0 
+			while [ ! -z "${RA_LOCAL_BEIP[$i]}" ]  
+			do
+				IPUP="$( sh_test_becon ${RA_LOCAL_BEIP[$i]} )$?"
+
+				if [ "${IPUP}" = "${STARA[4]}0" ]; then
+					ocf_log debug "verified be at ${RA_LOCAL_BEIP[$i]} is reachable: OK"
+					rc=$OCF_SUCCESS ; break
+				else
+					ocf_log debug "backend IP ${RA_LOCAL_BEIP[$i]} is NOT reachable"
+					rc=$OCF_ERR_GENERIC
+				fi
+				let i=$i+1
+				if [ "${i}" = "${#RA_LOCAL_BEIP[@]}" ] && [ "${rc}" = "$OCF_ERR_GENERIC" ]; then
+					ocf_log error "none of the configured backend IPs is reachable"
+				fi
+			done
+
+		elif [ "${OCF_RESKEY_certifier_role}" = "fe" ] && [ "${#RA_LOCAL_BEIP[@]}" -le 0 ]; then
+			ocf_log warning "running role fe without supervising BE connectivity!"
+		fi		
+
+		for port in $cports 
+		do 
+			sh_test_tcp ${port} || (rc=$OCF_ERR_GENERIC
+			ocf_log debug "port ${port} seems unreachable")
+		done
+
+	elif [ ${STARA[4]} = "FAIL" ]; then
+
+		for service in admin
+		do
+			rm -f "${RA_LOCAL_certifier_dir}/var/run/${service}\@`uname -n`.pid"
+		done
+		rc=$OCF_NOT_RUNNING
+		ocf_log info "process seems to be stopped: ${RA_LOCAL_certifier_server}"
+
+        elif [ ${STARA[4]} = "N.A." -o ${STARA[4]} = "NULL" ]; then
+                ocf_log debug "process not part of this role: ${RA_LOCAL_certifier_server}"
+                rc=$OCF_NOT_RUNNING
+
+        else
+                ocf_log err "can not recognize if this is the PID of ${RA_LOCAL_certifier_server}:${STARA[4]}"
+	fi
+
+return $rc
+}
+#
+#--------------------------------------------------------------------------------------------
+#############################################################################################
+# main helper functions
+#
+#############################################################################################
+#--------------------------------------------------------------------------------------------
+sh_check_if_hsm() {
+        nCipher_driver="(library \"/opt/nfast/toolkits/pkcs11/libcknfast.so\")"
+	unset ison ; 	
+        rc=$OCF_ERR_CONFIGURED
+
+	if [ -r ${RA_LOCAL_certifier_dir}/conf/engine.conf ] && [ "${OCF_RESKEY_certifier_role}" = "be" ] ; then
+		ison=$(cat ${RA_LOCAL_certifier_dir}/conf/engine.conf|sed -e 's/^[ \t]*//'|grep "^${nCipher_driver}" >/dev/null)$?
+	elif [ "${OCF_RESKEY_certifier_role}" = "fe" ] ; then
+                ison=1
+        else
+                ison=3
+                rc=$OCF_ERR_INSTALLED
+		
+		ismountd=$(mount |grep ${RA_LOCAL_certifier_dir}>/dev/null)$?
+                if [ $ismountd -eq 0 ]
+                then
+                        ocf_log err "no engine.conf even with mounted \"${RA_LOCAL_certifier_dir}\""
+                else
+                        ocf_log debug "waiting for fs - resource not mounted \"${RA_LOCAL_certifier_dir}\""
+                fi
+	fi
+	
+        if [ ${ison} -eq 0 ]; then
+                RA_LOCAL_use_hsm=1
+                ocf_log debug "found out that hsm is enabled in engine.conf"
+                return 1
+        elif [ ${ison} -eq 1 ]; then
+                RA_LOCAL_use_hsm=0
+                ocf_log debug "found out that hsm will not be supervised"
+                return 0
+        elif ocf_is_probe; then
+                ocf_log debug "probe can not yet determine if hsm  is needed"
+                RA_LOCAL_use_hsm=0
+                return 0
+        else
+                ocf_log debug "no-probe and can not determine if snmp subagent is neeeded"
+                return $OCF_ERR_CONFIGURED
+        fi
+}
+#
+#--------------------------------------------------------------------------------------------
+sh_check_if_snmp() {
+
+	unset ison
+	if [ -r ${RA_LOCAL_certifier_dir}/conf/engine.conf ] && [ "${OCF_RESKEY_certifier_role}" = "be" ] ; then
+	        ison=$(grep -i "snmp (enabled \"true\")" ${RA_LOCAL_certifier_dir}/conf/engine.conf|grep -v ";" &>/dev/null)$?
+	elif [ "${OCF_RESKEY_certifier_role}" = "fe" ] ; then
+		ison=1
+	else
+		ison=3
+		rc=$OCF_ERR_INSTALLED
+		
+		ismountd=$(mount |grep ${RA_LOCAL_certifier_dir}>/dev/null)$?
+		if [ $ismountd -eq 0 ]
+		then
+			ocf_log err "no engine.conf even with mounted \"${RA_LOCAL_certifier_dir}\""
+		else
+			ocf_log debug "waiting for fs - resource not mounted \"${RA_LOCAL_certifier_dir}\""
+		fi
+	fi
+
+	if [ "${RA_LOCAL_IGNORE_ISNMP}" = "true" ]; then
+		RA_LOCAL_use_snmp=0
+		ocf_log debug "supervision of insta snmp subagent administratively disabled"
+		return 0
+	elif [ ${ison} -eq 0 ]; then
+		RA_LOCAL_use_snmp=1
+		ocf_log debug "found out that snmp subagent is enabled in engine.conf"
+		return 1
+        elif [ ${ison} -eq 1 ]; then
+		RA_LOCAL_use_snmp=0
+		ocf_log debug "found out that snmp subagent will not be supervised"
+		return 0
+	elif ocf_is_probe; then
+		ocf_log debug "probe can not yet determine if snmp subagent is needed"
+		RA_LOCAL_use_snmp=0
+		return 0
+	else
+                ocf_log debug "no-probe and can not determine if snmp subagent is neeeded"
+		return $OCF_ERR_CONFIGURED
+        fi
+}
+#
+#--------------------------------------------------------------------------------------------
+sh_get_config() {
+# [0]->db [1]->engine [2]->snmp [3]->hsm [4]->server
+#
+	local needs; local runcode
+	STARA=( "NULL" "NULL" "NULL" "NULL" "NULL" "0" "128" )
+	let needs=0; let runcode=128
+	rc=$OCF_ERR_GENERIC
+	
+	if   [ ${OCF_RESKEY_certifier_role} = "fe" ]; then
+		STARA[4]=$(pidof ${RA_LOCAL_certifier_server}) || STARA[4]="FAIL"
+		let needs=1; let runcode=132; rc=$OCF_SUCCESS
+			
+	elif [ ${OCF_RESKEY_certifier_role} = "be" ]; then
+		STARA[1]=$(pidof ${RA_LOCAL_certifier_engine}) || STARA[1]="FAIL"
+		STARA[4]=$(pidof ${RA_LOCAL_certifier_server}) || STARA[4]="FAIL"
+		STARA[0]=$(pidof ${RA_LOCAL_database_binary} ) || STARA[0]="FAIL"
+				
+		let needs=3; let runcode=228; rc=$OCF_SUCCESS
+
+		if [ ${RA_LOCAL_use_snmp} -eq 1 ]; then
+			STARA[2]=$(pidof ${RA_LOCAL_certifier_snmpagent}) || STARA[2]="FAIL"
+			let needs=4 ; let runcode=$runcode+16
+		elif [ ${RA_LOCAL_use_snmp} -eq 0  ]; then
+			STARA[2]="N.A."; let needs=3
+		else
+			STARA[2]="ERR" 
+			rc=$OCF_ERR_GENERIC; ocf_log err "can not determine required configuration of SNMP subagent"
+		fi
+
+		if [ ${RA_LOCAL_use_hsm} -eq 1 ]; then
+			STARA[3]=$(pidof ${RA_LOCAL_thales_daemon}) || STARA[3]="FAIL"
+			let needs=$needs+1 ; let runcode=$runcode+8
+		elif [ ${RA_LOCAL_use_hsm} -eq 0  ]; then
+			STARA[3]="N.A."
+		else 
+			STARA[3]="ERR"; 
+			rc=$OCF_ERR_GENERIC; ocf_log err "can not determine required configuration of HSM process"
+		fi
+		
+	else
+		ocf_log err "Can not determine HA role of this situation, exiting"
+		exit $OCF_ERR_UNIMPLEMENTED
+	fi
+
+	STARA[5]=$needs;STARA[6]=${runcode}	
+	ocf_log debug "config here is: ${STARA[@]}"
+	echo "${STARA[@]}"  
+	return $rc
+}
+#--------------------------------------------------------------------------------------------
+sh_start_thales() {
+	rc=$OCF_ERR_GENERIC
+	
+	rc_drivers="$(/etc/init.d/nc_drivers    start &>/dev/null)$?" && sleep 1
+	rc_hardser="$(/etc/init.d/nc_hardserver start &>/dev/null)$?" && sleep 1
+	thsnmp=( $(chkconfig --list nc_ncsnmpd|awk '{print $2" "$3" "$4" "$5" "$6" "$7}') )
+	crnl="$(runlevel |cut -d' ' -f 2)"
+	if [ "${thsnmp[$crnl]}" = "${crnl}:on" ]
+	then  
+		ocf_log debug "thales snmp daemon is configured in our runlevel \"${crnl}\" as well"
+		rc_ncsnmpd="$(/etc/init.d/nc_ncsnmpd    start &>/dev/null)$?" &&
+		[ "${rc_ncsnmpd}" -ne 0 ] || ocf_log err "can not start thales snmpd - ignoring it but thats bad"
+	else
+		ocf_log debug "thales snmp daemon is not used in our current runlevel  \"${crnl}\""
+	fi
+
+	if [ "${rc_drivers}" -eq 0 ] && [ "${rc_hardser}" -eq 0 ] ; then 
+		ocf_log info "started thales hsm drivers and daemon with exit 0"
+		rc=$OCF_SUCCESS
+	elif [ "${rc_drivers}" -ne 0 ] ; then
+		ocf_log err "/etc/init.d/nc_drivers returned ${rc_drivers}"
+		 rc=$OCF_ERR_GENERIC
+	elif [ "${rc_hardser}" -ne 0 ] ; then
+		ocf_log err "/etc/init.d/nc_hardser returned ${rc_hardser}"
+		rc=$OCF_ERR_GENERIC
+	else
+		ocf_log err "can not determine startup status of hsm - thats fatal"
+		rc=$OCF_ERR_GENERIC
+	fi	
+return $rc
+}
+#--------------------------------------------------------------------------------------------
+sh_stop_thales() {
+	rc=$OCF_ERR_GENERIC
+
+	rc_drivers="$(/etc/init.d/nc_drivers stop &>/dev/null)$?"    && ocf_log debug "thales hsm driver stopscript exit $rc_drivers"
+	rc_hardser="$(/etc/init.d/nc_hardserver stop &>/dev/null)$?" && ocf_log debug "thales hardserver stopscript exit $rc_hardser"
+	rc_ncsnmpd="$(/etc/init.d/nc_ncsnmpd    stop &>/dev/null)$?" && ocf_log debug "thales snmp daemon stopscript exit $rc_ncsnmpd"
+
+	if [ "$rc_drivers" -eq 0 ] && [ "$rc_hardser" -eq 0 ]  && [ "$rc_ncsnmpd" -eq 0 ] ; then
+		rc=$OCF_SUCCESS
+	else
+		rc=$OCF_ERR_GENERIC
+	fi
+
+return $rc
+}
+
+#--------------------------------------------------------------------------------------------
+#--------------------------------------------------------------------------------------------
+#############################################################################################
+# main functions
+#
+#############################################################################################
+#--------------------------------------------------------------------------------------------
+ICertifier_usage() {
+	cat <<END
+usage: $0 {start|stop|monitor|restart|validate-all|meta-data}
+
+Expects to have a fully populated OCF RA-compliant environment set.
+END
+}
+#
+#--------------------------------------------------------------------------------------------
+
+ICertifier_halt() {
+
+	sh_showrunpr() {
+        	unset PROCS
+        	PROCS=( $( sh_get_config ) );unset PROCS[5];unset PROCS[6]
+		[  ${RA_LOCAL_leave_hsm} = "yes" ] && unset PROCS[3]
+      		STILLON=( `echo ${PROCS[@]} |sed 's/[.FAILNULER]//g' ` ) &>/dev/null
+	        rc=${#STILLON[@]}
+     		echo "${STILLON[@]}"
+        	return $rc
+	}
+
+	rc=$OCF_ERR_GENERIC
+	PROCS=( $( sh_get_config ) );
+	role=${PROCS[6]}; unset PROCS[5]; unset PROCS[6]
+	status=$( ICertifier_status )$?
+	
+	leave_hsm="yes"
+
+	case ${status} in
+		${OCF_SUCCESS})
+			ocf_log info "stop command received for role ${role}"
+			( ${RA_LOCAL_insta_stopscript} &>/dev/null ) || \
+			( ocf_log err "Problem while run stop-script ${RA_LOCAL_certifier_dir}/ssh-ca-stop" )
+			if [ "${RA_LOCAL_leave_hsm}" = "no" ] ; then
+				( sh_stop_thales &>/dev/null ) || \
+				( ocf_log err "Problem while run thales stop procedure")
+			fi
+			sleep 3
+		;;      
+		${OCF_NOT_RUNNING})
+			ocf_log info "stop command received for role ${role} but resource already stopped clean!"
+			rc=$OCF_SUCCESS
+        	;;
+		${OCF_ERR_GENERIC})
+			ocf_log err "can not determine status of resource, trying to stop anyway!"
+		;;
+	esac
+		
+	haveprocs=$( sh_showrunpr >/dev/null )$?
+
+	let needprocs=0; let count=0; let threshold=12
+
+	while [ $haveprocs -ne $needprocs ]
+	do
+		STILLON=( $( sh_showrunpr ) )
+		
+		if [ $count -le $threshold ]; then
+			kill -TERM ${STILLON[@]} &> /dev/null
+			ocf_log warn "Trying to SIGTERM remaining processes: ${STILLON[@]}"
+		else
+			kill -KILL ${STILLON[@]} &> /dev/null
+			ocf_log warn "Timeout after ${threshold}s now SIGKILL remaining processes: ${STILLON[@]}"
+		fi
+
+		sleep 5
+		let count=$count+1
+		haveprocs=$( sh_showrunpr >/dev/null )$?
+	done
+
+	haveprocs=$( sh_showrunpr >/dev/null )$?
+
+	if [ $haveprocs  -eq 0 ] ; then	
+		ocf_log info "all certifier resource processes halted"
+		rc=$OCF_SUCCESS
+	else
+		ocf_log err "undefined process status after halt procedure"
+		rc=$OCF_ERR_GENERIC
+	fi
+
+#	if [ "$rc" = "$OCF_SUCCESS" ] 
+#	then
+#		let count=0; 
+#		um="$(umount $RA_LOCAL_certifier_dir &>/dev/null)$?"
+#		ocf_log info "tried to unmount $RA_LOCAL_certifier_dir and received exit \"$um\""
+#		while [ $um -ne 0 ] && [ $count -le $threshold ]
+#		do
+#			fuser -ck -TERM $RA_LOCAL_certifier_dir
+#			sleep 4 && sync; let count=$count+4
+#			um="$(umount $RA_LOCAL_certifier_dir &>/dev/null)$?"
+#		done
+#		
+#		if [ "$um" -ne 0 ] 
+#		then
+#			ocf_log err "WARNING: can not unmount $RA_LOCAL_certifier_dir - will force all shells there to end"
+#			fuser -ck -KILL $RA_LOCAL_certifier_dir &>/dev/null
+#			sleep 2
+#			fuser -ck -KILL $RA_LOCAL_certifier_dir &>/dev/null &&
+#			um="$(umount $RA_LOCAL_certifier_dir &>/dev/null)$?"
+#			ocf_log info "exiting with umount status \"${um}\" on \"$RA_LOCAL_certifier_dir\""
+#		else
+#			ocf_log info "all processes TERMed when unmounted \"$RA_LOCAL_certifier_dir\" with status \"${um}\""
+#		fi
+#	fi	
+
+	[ "${RA_LOCAL_leave_hsm}" = "yes" ] && [ "${OCF_RESKEY_certifier_role}" = "be" ] && ocf_log info "ending supervision of hardserver process - last seen with PID \"${PROCS[3]}\""
+
+        rm -f /var/lock/subsys/${OCF_RESKEY_certifier_role}  &> /dev/null
+        rm -f /var/run/${OCF_RESKEY_certifier_role}.pid      &> /dev/null
+
+	
+	return $rc
+}
+#
+#--------------------------------------------------------------------------------------------
+ICertifier_status() {
+
+	rc=$OCF_ERR_GENERIC	
+
+	local needs; local runcode
+	PTRC[0]="1";PTRC[1]="1";PTRC[2]="1";PTRC[3]="1";PTRC[4]="1"		
+	STARA=( $( sh_get_config ) )
+	
+	runcode="${STARA[6]}"
+	needs="${STARA[5]}"
+
+	PTRC[0]=$(sh_test_db)$?
+	PTRC[1]=$(sh_test_engine)$?
+	PTRC[2]=$(sh_test_csnmp)$?
+	PTRC[3]=$(sh_test_hsm)$?	
+	PTRC[4]=$(sh_test_server)$?
+
+	
+	case ${runcode} in
+
+		132)  
+		if [ ${PTRC[4]} -eq 0 ]; then
+			ocf_log debug  "role 132 running complete"
+			ocf_log debug "`basename ${RA_LOCAL_certifier_server}` running OK under PID ${STARA[4]}"
+			rc=$OCF_SUCCESS
+		elif [ ${PTRC[4]} -eq 7 ]; then
+			ocf_log info "role 132 cleanly stopped"
+			rc=$OCF_NOT_RUNNING
+		else
+			ocf_log info "role 132 incomplete some processes needed to run the resource are down!"
+			rc=$OCF_ERR_GENERIC
+		fi
+		;;
+
+		228) 
+		if [ ${PTRC[0]} -eq 0 ] && [ ${PTRC[1]} -eq 0 ] && [ ${PTRC[4]} -eq 0 ]; then
+			ocf_log debug "role 228 running complete"
+			ocf_log debug "`basename ${RA_LOCAL_database_binary}` running OK under PID ${STARA[0]}"			
+			ocf_log debug "`basename ${RA_LOCAL_certifier_engine}` running OK under PID ${STARA[1]}"
+			ocf_log debug "`basename ${RA_LOCAL_certifier_server}` running OK under PID ${STARA[4]}"
+			rc=$OCF_SUCCESS
+		elif [ ${PTRC[0]} -eq 7 ] && [ ${PTRC[1]} -eq 7 ] && [ ${PTRC[4]} -eq 7 ]; then
+			ocf_log info "role 228 cleanly stopped"
+			rc=$OCF_NOT_RUNNING
+		else 
+			ocf_log info "role 228 incomplete some processes needed to run the resource are down!"
+			rc=$OCF_ERR_GENERIC
+		fi
+		;;
+
+		236)
+		if [ ${PTRC[0]} -eq 0 ] && [ ${PTRC[1]} -eq 0 ] && [ ${PTRC[3]} -eq 0 ] && [ ${PTRC[4]} -eq 0 ]; then		
+			ocf_log debug "role 236 running complete"
+			ocf_log debug "`basename ${RA_LOCAL_database_binary}` running OK under PID ${STARA[0]}"			
+			ocf_log debug "`basename ${RA_LOCAL_certifier_engine}` running OK under PID ${STARA[1]}"
+			ocf_log debug "`basename ${RA_LOCAL_thales_daemon}` running OK under PID ${STARA[3]}"
+			ocf_log debug "`basename ${RA_LOCAL_certifier_server}` running OK under PID ${STARA[4]}"
+			rc=$OCF_SUCCESS
+		elif [ ${PTRC[0]} -eq 7 ] && [ ${PTRC[1]} -eq 7 ] && [ ${PTRC[3]} -eq 7 ] && [ ${PTRC[4]} -eq 7 ]; then
+
+			ocf_log info "role 236 cleanly stopped"
+			rc=$OCF_NOT_RUNNING
+		elif [ ${PTRC[0]} -eq 7 ] && [ ${PTRC[1]} -eq 7 ] && [ ${PTRC[3]} -eq 0 ] && [ ${RA_LOCAL_leave_hsm} = "yes" ] &&  [ ${PTRC[4]} -eq 7 ]; then
+
+			ocf_log info "role 236 cleanly stopped, hsm processes remain up"
+			rc=$OCF_NOT_RUNNING
+
+		elif [ ${PTRC[3]} -ne 0 ] && [ "${OPCARD}" = "NOK" ]; then
+			
+			ocf_log info "problem with hsm status or cardreader, check if operator card is in and switch to operational" 
+			rc=$OCF_ERR_GENERIC
+		else
+			ocf_log info "role 236 incomplete some processes needed to run the resource are down!"
+			rc=$OCF_ERR_GENERIC			
+		fi
+		;;
+
+		244)
+		if [ ${PTRC[0]} -eq 0 ] && [ ${PTRC[1]} -eq 0 ] && [ ${PTRC[2]} -eq 0 ] && [ ${PTRC[4]} -eq 0 ]; then		
+			ocf_log debug "role 244 running complete"
+			ocf_log debug "`basename ${RA_LOCAL_database_binary}` running OK under PID ${STARA[0]}"			
+			ocf_log debug "`basename ${RA_LOCAL_certifier_engine}` running OK under PID ${STARA[1]}"
+			ocf_log debug "`basename ${RA_LOCAL_certifier_snmpagent}` running OK under PID ${STARA[2]}"
+			ocf_log debug "`basename ${RA_LOCAL_thales_daemon}` running OK under PID ${STARA[3]}"			
+			ocf_log debug "`basename ${RA_LOCAL_certifier_server}` running OK under PID ${STARA[4]}"
+			rc=$OCF_SUCCESS
+		elif [ ${PTRC[0]} -eq 7 ] && [ ${PTRC[1]} -eq 7 ] && [ ${PTRC[2]} -eq 7 ] && [ ${PTRC[4]} -eq 7 ]; then
+		
+			ocf_log info "role 244 cleanly stopped"
+			rc=$OCF_NOT_RUNNING
+		else
+			ocf_log info "role 244 incomplete some processes needed to run the resource are down!"
+			rc=$OCF_ERR_GENERIC			
+		fi
+		;;
+		
+		252)
+		if [ ${PTRC[0]} -eq 0 ] && [ ${PTRC[1]} -eq 0 ] && [ ${PTRC[2]} -eq  0 ] && [ ${PTRC[3]} -eq 0 ] && [ ${PTRC[4]} -eq 0 ]; then		
+			ocf_log debug "role 252 running complete"
+			ocf_log debug "`basename ${RA_LOCAL_database_binary}` running OK under PID ${STARA[0]}"			
+			ocf_log debug "`basename ${RA_LOCAL_certifier_engine}` running OK under PID ${STARA[1]}"
+			ocf_log debug "`basename ${RA_LOCAL_certifier_snmpagent}` running OK under PID ${STARA[2]}"
+			ocf_log debug "`basename ${RA_LOCAL_certifier_server}` running OK under PID ${STARA[4]}"
+			rc=$OCF_SUCCESS
+		elif [ ${PTRC[0]} -eq 7 ] && [ ${PTRC[1]} -eq 7 ] && [ ${PTRC[2]} -eq 7 ] && [ ${PTRC[3]} -eq 7 ] && [ ${PTRC[4]} -eq 7 ]; then		
+
+			ocf_log info "role 252 cleanly stopped"
+			rc=$OCF_NOT_RUNNING
+		elif [ ${PTRC[0]} -eq 7 ] && [ ${PTRC[1]} -eq 7 ] && [ ${PTRC[2]} -eq 7 ] && [ ${PTRC[3]} -eq 0 ] && [ ${RA_LOCAL_leave_hsm} = "yes" ] && [ ${PTRC[4]} -eq 7 ]; then
+			ocf_log info "role 252 cleanly stopped, hsm processes remain up"
+			rc=$OCF_NOT_RUNNING
+		
+		elif [ "${OPCARD}" = "NOK" ]; then
+
+			ocf_log info "problem with hsm status or cardreader, check if operator card is in and switch to operational"
+			rc=$OCF_ERR_GENERIC
+		else
+			ocf_log info "role 252 incomplete some processes needed to run the resource are down!"
+			rc=$OCF_ERR_GENERIC			
+		fi
+		;;
+	esac	
+
+	return $rc
+}
+#
+#--------------------------------------------------------------------------------------------
+ICertifier_validate() {
+	rc=$OCF_SUCCESS
+	
+#	HAIF="eth3" ; unset IS_SBY
+#        ETHSTAT="$(ip link show ${HAIF}|awk -v ETHIF="${HAIF}:" '($2==ETHIF) && ($9=="UP") { print$3}'|cut -d',' -f3)"
+#	NODES=( $(crm configure show|grep "node "|cut -d' ' -f 2) )
+#	for i in ${NODES[@]}
+#	do
+#		NODSTAT="$(crm node attribute ${i} show "standby" |cut -d' ' -f 4 1>&1)"
+#		[ "${NODSTAT}" = "value=on" ] && IS_SBY="yes"
+#	done
+#
+#	if [ "${ETHSTAT}" != "UP" ] && [ -z "${IS_SBY}" ]; then
+#		ocf_log debug "local HA interface ${haif} is not available and noone in SBY- getting out in panic"
+#		rc=$OCF_ERR_INSTALLED
+#		crm node standby `uname -n`		
+#	fi
+
+
+	if [ "${OCF_RESKEY_certifier_role}" != "be" ] && [ "${OCF_RESKEY_certifier_role}" != "fe" ]
+	then
+		ocf_log debug "This RA supports roles fe XOR be as op parameters OCF_RESKEY! seems your crm config is wrong"
+		rc=$OCF_ERR_CONFIGURED
+	fi
+ 
+        if ! grep ^"${RA_LOCAL_certifier_user}:" /etc/passwd >/dev/null; then
+                rc=$OCF_ERR_ARGS
+                ocf_log debug "certifier user \"${RA_LOCAL_certifier_user}\" does not exist"
+        fi
+
+        if [ ! -d ${RA_LOCAL_certifier_dir} ]; then
+                rc=$OCF_ERR_INSTALLED
+                ocf_log debug "certifier directory \"${RA_LOCAL_certifier_dir}\" does not exist"
+        fi
+
+	ismountd=$(mount |grep ${RA_LOCAL_certifier_dir}>/dev/null)$?
+	if [ $ismountd -ne 0 ] && [ "${OCF_RESKEY_certifier_role}" = "be" ]
+	then
+		ocf_log debug "validation failure because DRBD resource not mounted \"${RA_LOCAL_certifier_dir}\""
+		$(${drbd_workaround})
+	elif [ $ismountd -ne 0 ] && [ "${OCF_RESKEY_certifier_role}" = "fe" ]
+	then
+		mount ${RA_LOCAL_certifier_dir} && sync
+		ocf_log debug "mounted Filesystem to start certifsub server \"$(cat /proc/mounts|awk -v FSD="$RA_LOCAL_certifier_dir" '($2==FSD){print $1" - "$2}')\""
+	fi
+	
+        if ! ocf_is_probe; then
+
+                [ -f ${RA_LOCAL_certifier_server} ]  ||  rc=${OCF_ERR_INSTALLED}
+                [ -f ${RA_LOCAL_insta_startscript} ] ||  rc=${OCF_ERR_INSTALLED}
+                [ -f ${RA_LOCAL_insta_stopscript} ]  ||  rc=${OCF_ERR_INSTALLED}
+                [ -x ${RA_LOCAL_certifier_server} ]  ||  rc=${OCF_ERR_PERM}
+                [ -x ${RA_LOCAL_insta_startscript}  ]||  rc=${OCF_ERR_PERM}
+                [ -x ${RA_LOCAL_insta_stopscript} ]  ||  rc=${OCF_ERR_PERM}
+
+                if [ ${OCF_RESKEY_certifier_role} = "be" ]; then
+			[ -f ${RA_LOCAL_certifier_dir}/bin/ssh-ca-runenv ] || rc=${OCF_ERR_INSTALLED}
+			[ -x ${RA_LOCAL_certifier_dir}/bin/ssh-ca-runenv ]  ||  rc=${OCF_ERR_PERM}
+                        [ -f /opt/sqlanywhere12/bin64/dbeng12 ] || rc=$OCF_ERR_INSTALLED
+                        [ -r ${RA_LOCAL_certifier_db} ] || rc=$OCF_ERR_INSTALLED
+                        [ -f ${RA_LOCAL_certifier_engine} ]     || rc=$OCF_ERR_INSTALLED
+                        if ! grep "${RA_LOCAL_certifier_dir}" /etc/mtab > /dev/null ; then ( rc=$OCF_ERR_INSTALLED; ocf_log debug "certifier filesystem not mounted" ); fi
+                        [ -x /opt/sqlanywhere12/bin64/dbeng12 ] || rc=$OCF_ERR_PERM
+                        [ -x ${RA_LOCAL_certifier_engine} ]     || rc=$OCF_ERR_PERM
+                fi
+        fi
+        if [ $rc -ne ${OCF_SUCCESS} ] ; then ocf_log info "validation failed! rc=$rc"; fi
+
+return $rc
+}   	
+#
+#--------------------------------------------------------------------------------------------	
+ICertifier_start() {
+	
+	rc=$OCF_ERR_GENERIC
+	let count=0; let threshold=50	
+	ROLE=( $(sh_get_config) );role=${ROLE[6]}
+	status=$( ICertifier_status )$?
+
+	case ${status} in
+		${OCF_SUCCESS})
+			ocf_log info "start command received but resource already running fine in role ${role}"
+			rc=$OCF_SUCCESS	
+		;;
+		${OCF_NOT_RUNNING})
+			ocf_log info "start command received for role ${role}"
+			if [ "${RA_LOCAL_use_hsm}" = 1 ] ; then
+				hsmrc="$( sh_start_thales &> /dev/null )$?"
+				ocf_log info "procedure to start thales hsm executed and returned $hsmrc"
+			fi	
+			
+			$( ${RA_LOCAL_insta_startscript} &> /dev/null ); erc=$?
+			ocf_log info "certifier start command executed external startscript returned exit ${erc}"
+			sleep 2			
+		        while [ $rc -ne 0 ] && [ $count -le $threshold ] 
+			do
+				rc=$( ICertifier_status )$?
+				sleep 2
+				let count=$count+1
+				let logit=( $count % 10 )
+				[ $logit -eq 0 ] && ocf_log warn "after ${count} sec still waiting for all procs to be ready"
+			done    
+		;;
+		${OCF_ERR_GENERIC})
+			ocf_log warn "start command received while resource status unclear! use STOP first!"
+			rc=$OCF_ERR_GENERIC
+		;;
+	esac
+	
+	if [ $count -ge $threshold ]; then
+		ocf_log err "unable to start resource in configured role ${role}! Resource agent timed out after ${count} times 2 sec!"
+	else
+		ocf_log info "resource started in role ${role} status result: ${rc}" 
+	fi
+	return $rc
+}
+#
+#--------------------------------------------------------------------------------------------
+#############################################################################################
+# call main functions
+#
+#############################################################################################
+if [ $# != 1 ]; then
+	ocf_log err "resource agent called without specified action"        
+	ICertifier_usage
+        exit $OCF_ERR_ARGS
+fi 
+
+unset PTRC
+
+RA_LOCAL_use_hsm=$(sh_check_if_hsm)$?
+RA_LOCAL_use_snmp=$(sh_check_if_snmp)$?
+
+case $__OCF_ACTION in
+	start)
+		ICertifier_halt; let i=0
+		while [[ ! -z "${REBIND_IP_COMMAND[$i]}" || $i<2 ]]
+		do
+			if [ ! -z "${REBIND_IP_COMMAND[$i]}" ] ; then 
+				rrc="$(${REBIND_IP_COMMAND[$i]} &>/dev/null)$?" && sync
+				ocf_log debug "found REBIND_IP_COMMAND in config file \"${REBIND_IP_COMMAND[$i]}\""
+				ocf_log info "executed for rebind to cluster IP \"${REBIND_IP_COMMAND[$i]}\" and got exit \"${rrc}\""
+			fi
+			let i=$i+1	
+		done
+		( ICertifier_validate ) && ICertifier_start	
+		rc=$?
+		;;
+	stop)
+		ICertifier_halt		
+		rc=$?
+		;;
+	monitor)
+		( ICertifier_validate ) && ICertifier_status 
+		rc=$?
+		;;
+	restart)
+		ICertifier_halt
+		rc=$?
+		[ "${rc}" = "${OCF_SUCCESS}" ] && ICertifier_start
+		( ICertifier_validate ) && ICertifier_status
+		rc=$?
+		;;
+	validate-all)
+		ICertifier_validate
+		;;
+	meta-data)
+		meta_data
+		exit $OCF_SUCCESS
+		;;
+	*)	
+		ICertifier_usage
+		exit $OCF_ERR_UNIMPLEMENTED
+		;;
+esac
+ocf_log debug "${OCF_RESOURCE_INSTANCE} $__OCF_ACTION : $rc"
+exit ${rc}
+

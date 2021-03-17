@@ -1,0 +1,266 @@
+#!/bin/bash
+# NSN INSTA HAPF2.0 PLATFORM SCRIPT
+#--------------------------------------------------------------------------
+# Script default name   : ~script/reset_bonding
+# Configure version     : mkks62g.pl
+# Media set             : PF21I52RH64-12
+# File generated        : 19.07.2013 MPe
+#
+###########################################################################
+# chkconfig: 2345 99 1
+# description: Restarts physical interfaces used in a VLAN/8021q tagged \
+#              bonding interface. We saw the bonding is not working in kernel \
+#              2.6.32-279.el6.x86_64 and initscripts-9.03.27-1.el6_2.1.x86_64 \
+#              unless you give it a restart with ifup/down-ifcfg scripts.
+#
+# Return values according to LSB for all commands but status:
+: ${OCF_SUCCESS:=0}
+: ${OCF_ERR_GENERIC:=1}
+: ${OCF_ERR_ARGS:=2}
+: ${OCF_ERR_UNIMPLEMENTED:=3}
+: ${OCF_ERR_PERM:=4}
+: ${OCF_ERR_INSTALLED:=5}
+: ${OCF_ERR_CONFIGURED:=6}
+: ${OCF_NOT_RUNNING:=7}
+rc=$OCF_ERR_GENERIC
+usage() {
+bold=$(tput bold)
+normal=$(tput sgr0)
+printf "\n ${bold}USAGE:${normal}\n"
+printf "\t Restarts physical interfaces used in a 8021q tagged bonding interface\n"
+printf "\t -----------------------------------------------------------------------\n"
+printf "\t reset_bonding [start|stop|status/monitor]\n\n"
+printf "\t ${bold}start${normal}\n"
+printf "\t Simply run ifup-ifcfg / ifdown-ifcfg over the interfaces configured in \n"
+printf "\t /etc/hapf21.d/ICertifier-ha.cf (per default this script uses eth1 and eth2)\n\n"
+printf "\t ${bold}stop${normal}\n"
+printf "\t Halt the physical interfaces configured in /etc/hapf21.d/ICertifier-ha.cf\n"
+printf "\t (if none are defined, the default of this script stops eth1 and eth2)\n\n"
+printf "\t ${bold}[monitor|status]${normal}\n"
+printf "\t Check which NICs are configured for supervision either as default (or in\n"
+printf "\t the config /etc/hapf21.d/ICertifier-ha.cf) and print their status\n\n"
+return ${OCF_ERR_ARGS}
+}
+#----------------------------------------------------------------------------------
+TSTAMP=$(date +%Y%m%d-%H%M%S)
+export -p  MYSELF="reset_bonding" ; TAG=$MYSELF
+#----------------------------------------------------------------------------------
+[ $# -gt 0 ] || usage
+if [ "`whoami`" != "root" ]
+then
+        logger -p user.info -t ${TAG} "attempt to run \"${MYSELF}\" as \"`whoami`\" was rejected"
+        echo "only root is allowed to execute \"${MYSELF}\""
+        exit ${OCF_ERR_PERM}
+fi
+: ${MAINFLAG:="/etc/hapf21.flag"}
+: ${SETNSNENV:="/etc/hapf21.d/setnsnenv.sh"}
+if [ ! -f ${MAINFLAG} ] || [ ! -x ${SETNSNENV} ]
+then
+        echo "not a complete HAPF21 installation"
+        logger -p user.info -t ${TAG} "ERROR: stopping attempt to run \"${MYSELF}\" in incomplete environment"
+#        exit 1
+else
+        source ${MAINFLAG}
+        ROLE="${GENROLE}"
+	. ${SETNSNENV} ${ROLE}
+	echo "started for Role \"${ROLE}\" with args \"$*\""
+fi
+shf_debug_break () {
+        shf_cont () { : ; } ;
+        echo "---------------- enter \"shf_cont\" to resume ------------------"
+        unset line
+        DBP="#-DEBUG-#"
+        while [ "$line" != "shf_cont" ]
+        do
+                echo -n $DBP
+                read line
+                eval $line
+        done
+}
+#----------------------------------------------------------------------------------
+#----------------------------------------------------------------------------------
+#========================================================================================
+check_cf() {
+	rc=${OCF_ERR_GENERIC}
+	certifier_haconf="/etc/hapf21.d/ICertifier-ha.cfg"
+	unset NUMIF
+
+	if [ -r  ${certifier_haconf} ]; then
+		. ${certifier_haconf}
+		rc=$?
+		let NUMIF=${#RA_LOCAL_VLANETH[@]}
+		if [ "${rc}" = "${OCF_SUCCESS}" ]; then
+			rc=${OCF_SUCCESS}
+		else
+			shf_logit  "found configuration file \"${certifier_haconf}\" but can not access it"
+			rc=${OCF_ERR_PERM}
+		fi
+	fi
+
+	[ -z "${NUMIF}" ] && let NUMIF=0
+
+	if [ $NUMIF -le 0 ]; then
+		RA_LOCAL_VLANETH[0]=eth1
+		RA_LOCAL_VLANETH[1]=eth2
+		NUMIF=2
+		rc=${OCF_SUCCESS}
+	fi
+
+	echo ${RA_LOCAL_VLANETH[@]}
+	return ${rc}
+}
+#----------------------------------------------------------------------------------
+do_reset() {
+	local NIC=$1
+	local rc
+	STOPNIC="/etc/sysconfig/network-scripts/ifdown-eth"
+	STARTNIC="/etc/sysconfig/network-scripts/ifup-eth"
+
+	rc="$(ip link show ${NIC} &>/dev/null)$?"
+
+	if [ "${rc}" -eq "0" ]; then
+		${STOPNIC}  ifcfg-${NIC} && 		
+		${STARTNIC} ifcfg-${NIC} && sleep 3		
+		
+		rc="$(check_status ${NIC} &>/dev/null)$?"
+	fi
+
+	return $rc
+}
+
+#========================================================================================
+check_status() {
+	local rc
+	local NIC=$1
+	rc="$(ip link show ${NIC} &>/dev/null)$?"
+	NICSTAT=( $(ip link show ${NIC}|awk -v E="${NIC}" '($2==E":") {print $0}'|tr '[><:,]' ' '|tr --squeeze-repeats ' ') )
+
+	if [ "${NICSTAT[14]}" = "UP" ]; then
+		rc=${OCF_SUCCESS}
+	elif [ "${NICSTAT[14]}" = "DOWN" ] && [ "${NICSTAT[2]}" = "NO-CARRIER" ] && [ "${NICSTAT[5]}" = "SLAVE" ]; then
+		rc=${OCF_ERR_GENERIC}
+		echo "seems like cable is out on ${NIC}"
+	fi
+ 
+        return $rc
+}
+
+
+#========================================================================================
+stop_nic() {
+ 	rc=${OCF_ERR_GENERIC}
+	STOPNIC="/etc/sysconfig/network-scripts/ifdown-eth"
+	
+	${STOPNIC} ifcfg-${NIC} &>/dev/null; sleep 3
+	rc="$(ip link show ${NIC} &>/dev/null)$?"
+
+	return ${rc}
+}
+
+#========================================================================================
+rc=${OCF_ERR_GENERIC}
+
+while [ $# != 0 ]
+do
+	case $1 in
+	start)
+		
+		INTFCS=( $(check_cf) ); rc=$?
+		let i=${#INTFCS[@]}
+
+		case ${rc} in
+		0)
+			unset src rrc
+			for NIC in ${INTFCS[@]}
+			do
+				do_reset ${NIC}
+				src=$?; echo "interface ${NIC} reset status \"${src}\""
+				[ "${src}" -eq "0" ] || ( export -p rc=${OCF_ERR_GENERIC} )
+					
+			done
+
+			ROUTES="/etc/sysconfig/static-routes"
+			if [ -f "${ROUTES}" ] ; then
+				sed -e 's/^[ \t]*//; s/#[^#]*$//; /^$/d; /#/d' ${ROUTES}| while read STATROUTE
+				do
+					route add -$(echo ${STATROUTE#any })
+					rrc=$?; echo "re-apply route \"${STATROUTE#any}\" status \"${rrc}\""
+					[ "${rrc}" -eq "0" ] || ( export -p rc=${OCF_ERR_GENERIC} )	
+				done
+			fi
+		;;
+		1|2|3|4|5|6)
+			echo "ERROR: check for interfaces exit with \"${rc}\""	
+			rc=${OCF_ERR_GENERIC}
+		;;
+		7)
+			echo "ERROR: interfaces to supervise defined but down"
+			rc=${OCF_ERR_GENERIC}
+		;;
+		*)
+			usage
+		;;
+		esac	
+	;;
+	status|monitor)
+		INTFCS=( $(check_cf) ); rc=$?
+		let i=${#INTFCS[@]}; let n=0; let m=0
+		
+		if [ "${i}" -ge 1 ]; then
+			for NIC in ${INTFCS[@]}
+			do
+				check_status $NIC
+				rc=$?
+				case ${rc} in
+				0)
+					OUT[$m]="\"${NIC}\": OK \"${rc}\"" 
+					rc=${OCF_SUCCESS}; let m=$m+1
+				;;
+				1|3|4|5|6)
+					OUT[$m]="\"${NIC}\": ERROR \"${rc}\""
+					let n=$n+1; let m=$m+1
+					rc=${OCF_ERR_GENERIC}
+				;;
+				2)     
+					OUT[m]="\"${NIC}\": ARGS \"${rc}\""
+					let n=$n+1; let m=$m+1
+					rc=${OCF_ERR_GENERIC}
+				;;
+				7)
+					OUT[m]="\"${NIC}\": DOWN \"${rc}\""
+					rc=${OCF_ERR_CONFIGURED}
+				;;
+				*)
+					OUT[m]="UNIMPLEMENTED \"${rc}\""
+					rc=${OCF_ERR_UNIMPLEMENTED}
+				esac
+			done
+			if [ "${rc}" -eq "0" ]; then
+				echo "status OK : ${OUT[@]}"
+			else
+				echo "status NOK: ${OUT[@]}"
+			fi
+		else 
+			echo "no interfaces found to supervise"
+			rc="${OCF_ERR_CONFIGURED}"
+		fi
+	;;
+	stop)
+		INTFCS=( $(check_cf) ); rc=$?
+		if [ "${rc}" -eq "0" ]; then
+			for NIC in ${INTFCS[@]}
+			do
+				stop_nic ${NIC}	
+				rc=$?
+			done
+		else
+			echo "can not check bond status: exit \"${rc}\" \"${INTFCS[@]}\""
+			rc=${OCF_ERR_GENERIC}
+		fi
+	;;
+	*)
+		usage; rc=$?
+	;;
+esac ; shift ; done
+echo "ending script \"${MYSELF}\" with exit \"${rc}\""
+exit $rc

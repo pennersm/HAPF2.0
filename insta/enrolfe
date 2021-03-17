@@ -1,0 +1,488 @@
+#!/bin/bash
+###########################################################################
+# NSN INSTA HAPF2.1 RAPID SETUP CONFIG GENERATOR SCRIPT
+#--------------------------------------------------------------------------
+# Script default name   : ~insta/enrolfe
+# Configure version     : mkks62g.pl
+# Media set             : PF21I52RH64-12
+# File generated        : 19.07.2013 MPe
+#
+###########################################################################
+export -p  MYSELF="enrolfe"
+MYTMP="/tmp/.enrolfe_$$"
+: ${DEFPORT:="7001"}
+CDIR="/usr/local/certifsub"
+SSHCASETUP="${CDIR}/ssh-ca-setup-nsn-certifsub.sh"
+SERVER="${CDIR}/bin/ssh-ca-server"
+ENGCONF="${CDIR}/conf/server.conf"
+FETOOL="${CDIR}/bin/enrolfe"
+: ${HACFGFILE:="/etc/hapf21.d/ICertifier-ha.cfg"}
+trap "myexit" SIGHUP SIGINT SIGTERM
+#----------------------------------------------------------------------------------
+isroot() {
+if [ "`whoami`" != "root" ]
+then
+        logger -p user.info -t ${MYSELF} "attempt to run FE-enrollment as \"`whoami`\" was rejected"
+        echo "only root is allowed to run the FE enrollment procedure"
+        exit 1
+fi
+} ; isroot
+#----------------------------------------------------------------------------------
+shf_debug_break () {
+	MARK="$1"
+        shf_cont () { : ; } ;
+        echo "--MARK:${MARK}---------------- enter \"shf_cont\" to resume ------------------"
+        unset line
+        DBP="#-DEBUG-#"
+        while [ "$line" != "shf_cont" ]
+        do
+                echo -n $DBP
+                read line
+                eval $line
+        done
+}
+#----------------------------------------------------------------------------------
+myexit() {
+        rc="$1"
+        : ${OLDTERM:="xterm"}
+        export -p TERM="${OLDTERM}"; stty sane
+        [ -f "{$MYTMP}" ] && rm -f ${MYTMP}
+        [ -z "${rc}" ] && rc=6
+	[ "${USEGUI}" = "yes" ] && clear
+        exit ${rc}
+}
+#----------------------------------------------------------------------------------
+shf_say() {
+	MSG="$*"
+	MYCALL=${MYSELF}
+	MYTIME=`date  "+%b %e %H:%M:%S"`
+	MYHOST=`uname -n`
+	: ${LOGFILE:="/var/log/hapf21_postinst.log"}
+
+	if [ "${USEGUI}" = "yes" ] ; then
+		[ "${MAKEENGCONF}" = "yes" ] && echo "${MYTIME} ${MYHOST} ${MYCALL}  $*" >>  ${LOGFILE}
+	elif [ "${USEGUI}" = "no" ]; then
+		echo "${MYTIME} ${MYHOST} ${MYCALL}  $*" |tee -a ${LOGFILE}
+	fi
+}
+#----------------------------------------------------------------------------------
+shf_go_hapf() {
+	FORCEHAPF="$1" ; : ${FORCEHAPF:="enforce"}
+        : ${MAINFLAG:="/etc/hapf21.flag"}
+        if [ ! -f ${MAINFLAG} ] && [ "${FORCEHAPF}" = "enforce" ]
+        then
+                echo "ERROR: not a complete HAPF2.1 installation"
+                logger -p user.info -t ${MYSELF} "ERROR: stopping attempt to register frontend in incomplete environment"
+                myexit 2
+        elif [ -f ${MAINFLAG} ]
+	then
+                source ${MAINFLAG}
+                ROLE="${GENROLE}"
+                for PHASE1 in ${RUN[@]} ;do source ${PHASE1} ; done
+                shf_say "sourced HAPF2.1 environment for ${ROLE} of installation ${NOW}"
+		ISHAPF="yes"
+	else
+		ISHAPF="no"
+        fi
+
+}
+shf_go_hapf "noforce"; shf_set_index 2>/dev/null
+#----------------------------------------------------------------------------------
+#----------------------------------------------------------------------------------
+OLDTERM="$(echo $TERM)"
+if ( ps -ef |grep $(echo $$)|awk '{print $6}'|grep tty1 )
+then
+	export -p TERM="vt100"
+else
+	export -p TERM="xterm"
+fi
+#----------------------------------------------------------------------------------
+usage () {
+
+[ "$1" = "text" ] || GUITEXT="\n\Zb          use <up> <down> arrows and <tab> to navigate \Zn\n"
+CLITEXT="\n\n\
+You MUST specify both - PSK and BE IP address to enroll this FE. \
+Change the BE IP address or PSK if needed, see also HAPF2.1 install \
+guides and INSTA (R) Certifier Administration manuals to find \
+details on the following prerequiste procedures:\
+\n\
+- FE Servers must be created as server-instance in INSTA\n\
+- BE IP address must be reachable or enrolment will not start\n\
+- BE engine must be running and responding on port 7001\n\
+\n"
+TEXT="${GUITEXT}${CLITEXT}"
+if [ "${USEGUI}" = "yes" ] ; then
+dialog  --colors --title  "HAPF2.1 Rapid Setup" \
+	--msgbox "${TEXT}" 15 ${MAXW} 
+	return $?
+else
+	echo -e ${TEXT}
+	echo "NO ENROLMENT DONE!"; echo""
+	exit 1
+fi
+}
+#----------------------------------------------------------------------------------
+testip() {
+	TIP=$1 ; : ${DEFPORT:="7001"}
+	FIELD[0]="$(echo $TIP|cut -d':' -f 1)"
+	FIELD[1]="$(echo $TIP|cut -d':' -f 2)"
+	TIP="$(echo ${FIELD[0]}|tr -dc '[[:digit:].]')"
+	export -p MYFEIP="${TIP}"
+	rrc=1
+	
+	TPP="$(echo ${FIELD[1]}|tr -dc '[:digit:]')"
+	if [ ! -z "${TPP}" ] && [ "${TPP}" -le 65535 ] && [ "${DEFPORT}" = "7001" ]; then
+		shf_say "WARNING: TLS port changed to ${TPP} - mind that the engine must be configured accordingly"
+		export -p DEFPORT="${TPP}"
+	else
+		DEFPORT="7001"
+		export -p DEFPORT
+	fi
+
+	dotest() {
+		local STIP="$1";local rc=1
+		if [ "`echo ${STIP}|awk -F. '(($1<255) && ($2<255) && ($3<255) && ($4<255)){print$1"."$2"."$3"."$4}'`" = "${STIP}" ]
+		then
+			if ( ping -n -c 2 -q ${STIP} &> /dev/null ) 
+			then
+				rc=2; exec 2>/dev/null
+				prt="$(exec 5<>/dev/tcp/${TIP}/${DEFPORT} 3>&- )$?"
+				[ ${prt} -eq 0 ] && rc=0
+			else
+				shf_say "WARNING: icmp ping seems not possible to ${TIP}"
+				rc=$(( nmap -sT -P0 -p T:${DEFPORT} ${TIP} |grep "${DEFPORT}/tcp open" ) &>/dev/null )$?
+        			[ $rc -ne 0 ] && rc=1
+			fi
+		fi
+		5<&- ; 5>&-
+		echo $rc > ${MYTMP}	
+	}
+	[ "${USEGUI}" = "no" ] && $(dotest ${TIP})
+	[ "${USEGUI}" = "yes" ] && $(dotest ${TIP}) |dialog --gauge "Testing IP and port - please wait ...." 10 ${MAXW} 0
+	rrc=$(<"${MYTMP}")
+	shf_say "testing \"${TIP}:${DEFPORT}\" exited with status \"${rrc}\""
+
+	return $rrc
+}
+#----------------------------------------------------------------------------------
+#----------------------------------------------------------------------------------
+enrol_fe() {
+
+	feedback() {
+		MYMSG="$*"
+		if [ "${USEGUI}" = "no" ]
+		then
+			TXTMSG="$(echo ${MYMSG}|sed 's/\\n//g;s/^//g;s/$/\\n/')"
+			shf_say ${TXTMSG} |tee -a ${LOGFILE}
+		else
+			dialog	--title "HAPF2.1 Rapid Setup" --colors \
+				--msgbox "${MYMSG}" 6 50
+			shf_say "${MYMSG}"
+		fi
+	}
+
+	local FEIP="$1"; local PSK="$2"
+	[ -z "${FEIP}" ] || [ -z "${PSK}" ] && (feedback "NO ENROLLMENT - need IP address \Zband\Zn PSK";main_menu)
+
+	testip ${FEIP}; rc=$?
+	if [ "${rc}" -eq 0 ]
+	then
+
+                : ${INSTDIR:="/tmp/Installmedia"}
+                RCINIT="/etc/init.d/certifsub"
+		MYNAM="$(basename ${RCINIT})"
+                NSNINIT="${INSTDIR}/insta/init-script.sh"
+                CPNAME="$(dirname ${RCINIT})_tmpsave_${MYNAM}_${MYSELF}.$$"
+		FIRSTINST="yes"
+		[ -f "${CDIR}/ssh-ca-start" ] && FIRSTINST="no"
+
+		if [ -f "${RCINIT}" ] && [ "${FIRSTINST}" = "no" ]; then
+			 NSNRC="$(${RCINIT} version |cut -d':' -f 2|grep "^ HAPF LSB init" &>/dev/null)$?"
+		else
+			NSNRC="1"
+		fi
+
+		if [ -x ${SSHCASETUP} ] && [ "${MAKEENGCONF}" = "yes" ]
+		then
+			[ "${USEGUI}" = "no" ] && shf_say "using \"readlink -m ${SSHCASETUP})\""
+		elif [ ! -x ${SSHCASETUP} ] && [ "${MAKEENGCONF}" = "yes" ]
+		then
+			feedback "no nsn-prepared ssh-ca-setup script found - can not create new server.conf"	
+			feedback "WARNING: your server certificate has not been renewed!"
+			myexit 3
+		fi
+
+                if [ "${NSNRC}" -eq "0" ] && [ "${MAKEENGCONF}" = "yes" ]; then
+                        cp -fp ${RCINIT} "${CPNAME}"                         
+                        shf_say "savecopied existing NSN Certifier init script for later restore: \"$(ls -l ${CPNAME})\""
+                elif [ "${NSNRC}" -ne 0 ] && [ -r ${NSNINIT} ] && [ "${MAKEENGCONF}" = "yes" ]; then
+                        cp -fp ${NSNINIT} "${CPNAME}"
+                        shf_say "placed default NSN Certifier init script for later acivation: \"$(ls ${CPNAME})\""         
+                elif [ "${MAKEENGCONF}" = "yes" ]; then
+                        shf_say "could not find an NSN certifier init script - you will use insta default or have to copy LSB compliant NSN scripts later"
+                fi
+
+		/etc/init.d/corosync stop &>/dev/null &&
+		if [ -f ${RCINIT} ] && [ "${FIRSTINST}" = "no" ]; then 
+			${RCINIT} stop &>/dev/null &&
+			crs="$(${RCINIT} status &>/dev/null)"
+			shf_say "certifier stop requested - rc script exit \"$crs\": \"`${RCINIT} status|tr '/n' ' '|tr --squeeze-repeats ' '`\""
+		fi
+		[ "${USEGUI}" = "yes" ] && clear	
+		if [ "${MAKEENGCONF}" = "yes" ]
+		then
+			shf_say "sourcing external script : \"`ls -l ${SSHCASETUP}`\""
+			echo "=====================================================================================================================" |tee -a ${LOGFILE}
+			echo " starting enrolment procedure using ${MYSELF} at `date` " |tee -a ${LOGFILE}
+			echo "=====================================================================================================================" |tee -a ${LOGFILE}
+			shf_say "using arguments ${ROLE} tcp://${FEIP}:${DEFPORT} ${PSK}"
+			. ${SSHCASETUP} ${ROLE} tcp://${FEIP}:${DEFPORT} ${PSK} 
+			rc=$?; export -p MYSELF="enrolfe"
+			shf_say "returned with \"${rc}\" from external script \"$(readlink -m ${SSHCASETUP})\""
+			sync && sleep 3
+		elif [ "${MAKEENGCONF}" = "no" ]; then
+			HERE="$PWD"; cd /usr/local/certifsub
+			shf_say "calling ssh-ca-server with option \"-E\" to enroll for new cert"
+			: ${CERTIFIER_SERVERPASS:=""}; export -p CERTIFIER_SERVERPASS
+			echo "=============================================================================" >> ${LOGFILE}
+			${SERVER} -d 0 -E "${PSK}" ${ENGCONF} &>> ${LOGFILE} &&
+			rc=$? 		
+			echo "=============================================================================" >> ${LOGFILE}
+			shf_say "returned with \"${rc}\" from call for new cert enrollment"
+			cd ${HERE}
+		fi
+
+		if [ -r "${CPNAME}" ] && [ "${MAKEENGCONF}" = "yes" ]
+		then
+			mv -f ${CPNAME} ${RCINIT}
+			chmod 0755 ${RCINIT}
+			chown root:root ${RCINIT}
+			shf_say "copied NSN HAPF2.1 Insta init script into place: `ls -la ${RCINIT}`"
+			chcon -R -h system_u:object_r:corosync_initrc_exec_t:s0 ${RCINIT}
+		fi
+
+		${RCINIT} stop &>/dev/null
+		rc="$(${RCINIT} start &>/dev/null)$?"
+		shf_say "test-started ${RCINIT} and received exit \"${rc}\" from rc start script"
+		shf_say "...waiting for BE connection or timeout"
+		sync && sleep 3
+		[ "${ISHAPF}" = "yes" ] && [ "${CLEANETCPROFILE}" = "yes" ] && ( shf_fshow ps -fu ${CUSER} )
+
+		CERTPID=$(cat /var/run/${MYNAM}.pid)
+		FSCIP="$(grep "(address \"tcp:" ${ENGCONF}|cut -d':' -f2|sed 's/\///g')"
+		if [ "${FSCIP}" != "${FEIP}" ] && [ "${MAKEENGCONF}" = "no" ]; then
+			FEIP="${FSCIP}" 
+			shf_say "WARNING: you are enrolling to a BE IP that is NOT configured in server.conf"
+		fi
+		NSTAT=$(netstat -tunap |grep ${CERTPID}|grep ${FEIP})
+		REALPIC=$(netstat -tunap  |awk -v SOCK="${FEIP}:${DEFPORT}" '($5==SOCK){print$6"/"$7}')
+		FILTER=$(echo ${REALPIC}| tr "\n" " ") ; REALPIC="${FILTER}"
+
+		SOCK="${CERTPID}/ssh-ca-server"
+		TAWK=$(echo ${NSTAT}|awk -v SOCK="${SOCK}" '(($6=="ESTABLISHED") && ($7==SOCK)){print$6"/"$7}')
+		
+		if [ "${TAWK}" = "ESTABLISHED/${SOCK}" ]
+		then
+			frc=0 
+			FILTER=$( echo ${NSTAT}|tr --squeeze-repeats '  ') ; NSTAT=${FILTER}
+			shf_say "FE<>BE connection \"${NSTAT}\""
+			if [ "${USEGUI}" = "yes" ] ; then
+				printf "\n\n====================================================\n"
+				printf "\n CONNECTION to BE ${FEIP} is up: ${NSTAT}\n"
+				printf "\n====================================================\n\n"
+			fi
+			${RCINIT} stop &>/dev/null; irc=$?
+			shf_say"halted services again and for now, stop command exited $irc" &>/dev/null
+			shf_say "in future you must use \"${RCINIT}\" or corosync to control certifier FE"
+		
+			chkconfig --level 0123456 ${MYNAM} off
+                        [ "${ROLE}" = "SingleServer" ] && chkconfig --level 45 ${MYNAM} on
+                        shf_say "current rc-init-setting of ${MYNAM} : \"$(chkconfig --list ${MYNAM}|sed 's/\t/ /g;s/   / /g')\"" 
+			
+		else
+			
+			shf_say "connection to BE ${MYTARGET} can not be verified"
+			printf "\n\n CONNECTION to BE ${MYTARGET} can not be verified"
+			frc=1
+		fi
+
+		if [ "${CLEANETCPROFILE}" = "yes" ]
+		then
+			CARRIERFILE="/etc/profile"
+			CMDLINE="${FETOOL}"
+			DELTHEM=( $(grep -n "${CMDLINE}" ${CARRIERFILE} |cut -d':' -f 1) )
+			REVRSDL=( $(echo ${DELTHEM[@]}|sort|tac -s' '|tr [:cntrl:] ' ') )	
+			for LINE in ${REVRSDL[@]} 
+			do
+				sed -i "${LINE} d" ${CARRIERFILE} 
+				shf_say "removed call \"${CMDLINE}\" from line \"${LINE}\" in \"${CARRIERFILE}\""
+			done
+		fi
+	else
+		feedback "test of \"${FEIP}\" not successfull - no valid BE defined"
+	fi
+		
+if [ "${frc}" -eq 0 ]
+then
+	if [ "${ADDCONNTRACK}" = "yes" ]; then
+		FILE="${HACFGFILE}"
+		[ -f ${FILE} ] || ( shf_tag_cffile ${FILE} "no-backup" ; chmod 0644 ${FILE} ; chown root:root ${FILE} )
+        	[ -w ${FILE} ] || feedback "can not add HA connection tracker because cant write to file \"$(ls -l ${FILE}|tr --squeeze-repeats ' ')\""
+
+		unset ALRDIN; MKENTRY="yes"
+		ALRDIN="$(grep "^RA_LOCAL_BEIP\[" ${FILE}|grep "${FEIP}")"
+		VALUE="$(echo ${ALRDIN}|awk -F'=' '{print$2}')"
+		VALIP="$(echo ${VALUE}|awk -F':' '{print$1}')"
+		VALPRT="$(echo ${VALUE}|awk -F':' '{print$2}')"
+		[ -z "${VALPRT}" ] && VALPRT="${DEFPORT}"
+
+		if [ "${VALIP}:${VALPRT}" = "${FEIP}:${DEFPORT}" ]; then
+			shf_say "ha connection tracking seems already configured for \"${VALIP}:${VALPRT}\""
+		else
+			source ${FILE}
+			let i=${#RA_LOCAL_BEIP[@]}
+			echo "RA_LOCAL_BEIP[$i]=${FEIP}:${DEFPORT}" >> ${FILE}
+			shf_say "added ha connection tracking \"${FEIP}:${DEFPORT}\" to \"$(ls -l ${FILE}|tr --squeeze-repeats ' ')\""	
+		fi
+	fi	
+
+	service certifsub start &&
+	feedback "registration of FE was successfull please run command \"service certifsub status\" to verify that ${MYNAM} processes are started"
+else
+	feedback "registration of FE was NOT successfull - check \"${LOGFILE}\" for details"
+fi
+/etc/init.d/corosync start &>/dev/null &&
+[ "${NOGUI}" = "no" ] && ( echo "" |tee -a ${LOGFILE} )
+shf_say "#-----------------------------------------------------------------"
+shf_say "leaving script ${MYSELF}"
+shf_say "#-----------------------------------------------------------------"
+myexit 0
+}
+#----------------------------------------------------------------------------------
+#----------------------------------------------------------------------------------
+#===================================================================================
+NUMARGS="$#" ; ALLARGS="$*" ; unset MYFEIP MYPSK ; USEGUI="yes"; MAKEENGCONF="no"; CLEANETCPROFILE="no"; ADDCONNTRACK="yes"
+while [ $# != 0 ]
+do
+        case $1 in
+              -ip|-IP)
+                        MYFEIP="$2"
+                        shift
+                        ;;
+               -psk|-PSK )
+                        MYPSK="$2"
+                        shift
+                        ;;
+		-nogui)
+			USEGUI="no"
+			;;
+		-isinstall)
+			CLEANETCPROFILE="yes"
+			MAKEENGCONF="yes"
+			;;
+		-noha)
+			ADDCONNTRACK="no"
+			;;
+                *)
+			USEGUI="no"
+                        usage "text"
+                        ;;
+esac; shift; done
+#===================================================================================
+shf_say "#-----------------------------------------------------------------"
+shf_say "starting to run script ${MYSELF}"
+shf_say "#-----------------------------------------------------------------"
+[[ "${ROLE}" == fe[1-4] ]] || (echo "ONLY run ${MYSELF} on FE to prevent damage to the certifier installation!!" ;myexit 1)
+shf_say "called with args: \"${ALLARGS}\""
+shf_say "using logfile \"${LOGFILE}\""
+
+main_menu() {
+while :
+do
+
+dialog --colors --help-button \
+--ok-label "enroll !" \
+--extra-button --extra-label "test IP & port" \
+--cancel-label "exit" \
+--form "\n\
+        \Zb YOU ARE ABOUT TO FINISH SETUP OF THE INSTA CA\Zn\n\
+ ${ROLE} @ ${HOSTNAME[$X]}, local TLS IP ${VLAN1IPADDR[$X]}, BE TLS IP ${LOCALINTIP[$X]}\n\
+ =================================================================\n\
+This procedure will finalise the Frontend configuration \
+by registering to the Backend engine. This process requires \
+that you have the following information at hand:\n\
+ - IP address and TCP port of the BE to connect to\n\
+ - PSK generated by the BE in the GUI-section \"Servers\"\n\
+\n THE BACKEND ENGINE MUST BE RUNNING WHEN YOU START THIS PROCEDURE\n
+\n If you do not have all needed information at hand, select \
+\"exit enrolment\" and come back after clarification!\n\n\n\
+" 25 ${MAXW}  4 \
+"Backend TLS IP Address     :" 2 4 "${MYFEIP}"  2 30 32 0 \
+"PSK generated for this FE  :" 4 4 "${MYPSK}" 4 30 32 0 \
+ 2>${MYTMP}
+
+ACTION="$?";OLDIP="${MYFEIP}" ; OLDPSK="${MYPSK}"
+INPUT=( $(<"${MYTMP}") );
+
+if [ "${INPUT[0]}" != "HELP" ]
+then
+        OLDIP="${MYFEIP}" ; OLDPSK="${MYPSK}"
+fi
+case ${ACTION} in
+
+        0) MYFEIP="${INPUT[0]}"; MYPSK="${INPUT[1]}" ; enrol_fe "${MYFEIP}" "${MYPSK}" ;;
+
+        1|255) myexit 5 ;;
+
+        2) usage; MYFEIP="${OLDIP}" ; MYPSK="${OLDPSK}" ;;
+
+        3) MYFEIP="${INPUT[0]}"; MYPSK="${INPUT[1]}" ;testip ${MYFEIP}; rc=$?
+           case ${rc} in
+                0) dialog --msgbox "IP address ${MYFEIP} is reachable and port ${DEFPORT} seems open" 15 ${MAXW} ;;
+                1) dialog --msgbox "ERROR: \"${MYFEIP}\" is not a reachable IP address" 15 ${MAXW} ;;
+                2) dialog --msgbox "ERROR: IP address \"${MYFEIP}\" is up but port ${DEFPORT} seems closed or blocked" 15 ${MAXW} ;;
+           esac
+esac
+done
+}
+#===================================================================================
+if [ "${USEGUI}" = "yes" ]
+then
+#----------------------------------------------------------------------------------
+if (! rpm -qa dialog &>/dev/null )
+then
+	echo "package dialog must be installed for ${MYSELF} to work"
+	[ "${CLEANETCPROFILE}" = "yes" ] && logout
+	[ "${CLEANETCPROFILE}" != "yes" ] && myexit 3
+fi
+MAXW="$(dialog --print-maxsize --output-fd 1|cut -d' ' -f3)"
+if [ ! -z "${MYFEIP}" ] && [ "${CLEANETCPROFILE}" = "yes" ]
+then
+	testip ${MYFEIP}; rc=$?
+	if [ "${rc}" -eq 0 ] ; then
+		dialog --msgbox "Initial parameters ${MYFEIP} at port ${DEFPORT} up and open - now add the PSK you created in the certifier GUI to enrol this FE" 15 ${MAXW} 
+		MYFEIP="${MYFEIP%:*}"
+	else
+		dialog --msgbox "HAPF config parameters ${MYFEIP} seem to point to an unreachable destination or port" 15 ${MAXW}
+	fi
+fi
+main_menu
+#----------------------------------------------------------------------------------
+elif [ "${USEGUI}" = "no" ] && [ ! -z "${MYFEIP}" ] && [ ! -z "${MYPSK}" ]
+then
+	shf_say "starting enrolment procedure of ${ROLE} for stamp ${NOW}"
+	shf_say "using PSK \"${MYPSK}\" for backend IP \"${MYFEIP}\""
+	testip ${MYFEIP}; rc=$?
+	case ${rc} in
+                0) shf_say "IP address \"${MYFEIP}\" is reachable and port ${DEFPORT} seems open" ;;
+                1) shf_say "ERROR: \"${MYFEIP}\" is not a reachable IP address - exiting"; myexit 1 ;;
+                2) shf_say "ERROR: IP address \"${MYFEIP}\" is up but port ${DEFPORT} seems closed or blocked - exiting"; myexit $2 ;;
+	esac
+
+	enrol_fe "${MYFEIP}" "${MYPSK}"
+	
+else
+	usage "text"
+fi
+#===================================================================================
+myexit 0
